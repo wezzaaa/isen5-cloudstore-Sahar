@@ -1,17 +1,112 @@
+//potential trap: loading Express before initialization can prevent automatic instrumentation from attaching. Initialize the SDK first
+import './instrumentation';
+import { metrics } from '@opentelemetry/api';
+import { prometheusExporter } from './instrumentation';
+
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { CheckoutRequest, CheckoutResponse, ErrorResponse } from './types';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8083;
 const SERVICE_NAME = 'service-c-order';
+const tracer = trace.getTracer(SERVICE_NAME);
+const meter = metrics.getMeter(SERVICE_NAME);
+
+const httpRequests = meter.createCounter('http_requests', {
+  description: 'Number of completed HTTP requests',
+});
+
+const httpDuration = meter.createHistogram('http_request_duration_seconds', {
+  description: 'Duration of completed HTTP requests',
+  unit: 's',
+});
+
+function logEvent(
+  level: 'info' | 'warn' | 'error',
+  event: string,
+  fields: Record<string, unknown> = {},
+) {
+  const spanContext = trace.getActiveSpan()?.spanContext();
+
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    service: SERVICE_NAME,
+    event,
+    trace_id: spanContext?.traceId ?? null,
+    span_id: spanContext?.spanId ?? null,
+    ...fields,
+  }));
+}
 
 // Downstream service configuration
 const AUTH_SERVICE_URL = process.env.AUTH_SERVICE_URL || 'http://service-a:8081';
 const CATALOG_SERVICE_URL = process.env.CATALOG_SERVICE_URL || 'http://service-b:8082';
 const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://service-d:8084';
 
+app.use((req, res, next) => {
+  // Exclude scrapes so monitoring traffic does not affect RED metrics.
+  if (req.path === '/metrics') {
+    next();
+    return;
+  }
+
+  const started = process.hrtime.bigint();
+  // potential trap: reading the active span only inside "finish" may lose request correlation. Following the course, capture its IDs while the request context is active.
+  const requestSpanContext = trace.getActiveSpan()?.spanContext();
+
+  res.once('finish', () => {
+    const route =
+      typeof req.route?.path === 'string'
+        ? req.route.path
+        : 'unmatched';
+
+    const method = [
+      'GET', 'POST', 'PUT', 'PATCH', 'DELETE',
+      'HEAD', 'OPTIONS', 'CONNECT', 'TRACE',
+    ].includes(req.method)
+      ? req.method
+      : 'OTHER';
+
+    const labels = {
+      method,
+      route,
+      status: String(res.statusCode),
+    };
+
+    const durationSeconds =
+      Number(process.hrtime.bigint() - started) / 1e9;
+
+    // Never add user IDs, order IDs, tokens or raw URLs as metric labels.
+    httpRequests.add(1, labels);
+    httpDuration.record(durationSeconds, labels);
+      logEvent(
+      res.statusCode >= 500
+        ? 'error'
+        : res.statusCode >= 400
+          ? 'warn'
+          : 'info',
+      'http.request.completed',
+      {
+        method,
+        route,
+        status: res.statusCode,
+        duration_seconds: durationSeconds,
+        trace_id: requestSpanContext?.traceId ?? null,
+        span_id: requestSpanContext?.spanId ?? null,
+        user_id: res.locals.user_id,
+        order_id: res.locals.order_id,
+        reservation_id: res.locals.reservation_id,
+        transaction_id: res.locals.transaction_id,
+      },
+    );
+  });
+
+  next();
+});
 app.use(cors());
 app.use(express.json());
 
@@ -31,16 +126,10 @@ app.get('/healthz', (_req: Request, res: Response) => {
 
 /**
  * GET /metrics
- * Purpose: Prometheus exposition format endpoint.
- * Skeleton: Returns 501 Not Implemented.
- * TODO [Lab 2]: Install prom-client and implement RED metrics collection (http_requests_total, http_request_duration_seconds).
+ * Unauthenticated Prometheus exposition endpoint for OpenTelemetry metrics.
  */
-app.get('/metrics', (_req: Request, res: Response<ErrorResponse>) => {
-  res.status(501).json({
-    error: 'Not Implemented',
-    message: 'GET /metrics is not implemented in this skeleton. Implement Prometheus metrics in Lab 2.',
-    status_code: 501,
-  });
+app.get('/metrics', (req: Request, res: Response) => {
+  prometheusExporter.getMetricsRequestHandler(req, res);
 });
 
 // ==========================================
@@ -59,15 +148,23 @@ app.get('/metrics', (_req: Request, res: Response<ErrorResponse>) => {
 app.post(
   '/orders/checkout',
   async (req: Request<{}, {}, CheckoutRequest>, res: Response<CheckoutResponse | ErrorResponse>) => {
-    // TODO [Before day 2]:
-    // 1. Validate incoming checkout payload (user_id, items, payment_method).
-    // 2. Call Service A (GET /auth/verify) passing W3C traceparent headers.
-    // 3. Call Service B (POST /inventory/reserve) passing W3C traceparent headers.
-    // 4. Call Service D (POST /payments/charge) passing W3C traceparent headers.
-    // 5. If any step fails, trigger compensating transactions (POST /inventory/release).
-    // 6. Return 201 Created { order_id, status: "CONFIRMED" }.
+    //potential trap: manually adding CLIENT spans around fetch would duplicate Undici instrumentation. but active context links its automatic CLIENT spans to this business operation
+    return tracer.startActiveSpan('checkout', async (span) => {
+      try {
     const fail = (status: number, message: string) => {
-      res.status(status).json({ error: 'Checkout failed', message, status_code: status });
+      span.setAttribute('checkout.outcome', 'failed');
+      span.setAttribute('checkout.response_status', status);
+      span.addEvent('checkout.failure', { reason: message });
+
+      if (status >= 500) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+
+      res.status(status).json({
+        error: 'Checkout failed',
+        message,
+        status_code: status,
+      });
     };
     const { user_id, items, payment_method } = req.body ?? {};
     if (typeof user_id !== 'string' || !user_id.trim() || typeof payment_method !== 'string' || !payment_method.trim()
@@ -83,15 +180,14 @@ app.post(
       return;
     }
 
-    const incomingTrace = req.header('traceparent');
-    const validTrace = incomingTrace && /^00-[a-f0-9]{32}-[a-f0-9]{16}-[a-f0-9]{2}$/.test(incomingTrace)
-      && !incomingTrace.split('-').slice(1, 3).some((id) => /^0+$/.test(id));
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      traceparent: validTrace ? incomingTrace! : `00-${randomBytes(16).toString('hex')}-${randomBytes(8).toString('hex')}-01`,
-    };
-    if (validTrace && req.header('tracestate')) headers.tracestate = req.header('tracestate')!;
+// potential trap: copying the same traceparent to every call reused its parent ID? BUT outgoing calls need child spans. Undici instrumentation creates those spans and injects their context.
+const headers: Record<string, string> = {
+  'Content-Type': 'application/json',
+};
     const orderId = `ORD-${randomUUID()}`;
+    // potential trap: dynamic IDs could become metric labels. we put these IDs in span attributes instead.
+span.setAttribute('order.id', orderId);
+res.locals.order_id = orderId;
     let reservationId: string | undefined;
     let paymentStarted = false;
     const releaseInventory = async () => {
@@ -101,7 +197,18 @@ app.post(
           signal: AbortSignal.timeout(3000),
         });
         return response.ok;
-      } catch { return false; }
+      } catch (error) {
+        logEvent('error', 'inventory.release.exception', {
+          route: '/orders/checkout',
+          order_id: orderId,
+          reservation_id: reservationId,
+          error_type: error instanceof Error ? error.name : 'UnknownError',
+          error_message: error instanceof Error ? error.message : 'Unknown error',
+        });
+        span.recordException(error instanceof Error ? error : new Error(String(error)));
+        span.addEvent('inventory.release.failed');
+        return false;
+      }
     };
 
     try {
@@ -115,7 +222,9 @@ app.post(
       const auth = await authResponse.json();
       if (auth.valid !== true || typeof auth.user_id !== 'string') { fail(502, 'Invalid authentication response'); return; }
       if (auth.user_id !== user_id) { fail(403, 'user_id does not match the authenticated user'); return; }
-      headers.baggage = `user_id=${encodeURIComponent(auth.user_id)}`;
+      //potential trap: a manually assigned baggage header is not active OpenTelemetry context. wekeep this identifier as an attribute on the current span.
+      trace.getActiveSpan()?.setAttribute('user.id', auth.user_id);
+      res.locals.user_id = auth.user_id;
 
       // Payment needs amount_cents; the existing reservation response contains no prices.
       const productsResponse = await fetch(`${CATALOG_SERVICE_URL}/products`, { headers, signal: AbortSignal.timeout(3000) });
@@ -140,6 +249,11 @@ app.post(
         fail(502, 'Invalid reservation response'); return;
       }
       reservationId = reservation.reservation_id;
+      res.locals.reservation_id = reservationId;
+      if (reservationId !== undefined) {
+        span.setAttribute('reservation.id', reservationId);
+      }
+      span.setAttribute('order.total_cents', totalCents);
 
       paymentStarted = true;
       const paymentResponse = await fetch(`${PAYMENT_SERVICE_URL}/payments/charge`, {
@@ -151,6 +265,8 @@ app.post(
       const declined = (paymentResponse.status >= 400 && paymentResponse.status < 500)
         || (paymentResponse.ok && ['FAILED_DECLINED', 'FAILED_INSUFFICIENT_FUNDS'].includes(payment?.status));
       if (declined) {
+        span.addEvent('payment.declined');
+        span.addEvent('inventory.release.requested');
         if (!await releaseInventory()) { fail(502, 'Payment failed and inventory release failed'); return; }
         res.status(402).json({ order_id: orderId, status: 'FAILED', message: 'Payment declined; inventory released' });
         return;
@@ -158,21 +274,53 @@ app.post(
       if (!paymentResponse.ok || payment?.status !== 'SUCCESS' || typeof payment.transaction_id !== 'string' || !payment.transaction_id) {
         fail(502, `Payment outcome unknown; reservation ${reservationId} retained`); return;
       }
+      span.setAttribute('checkout.outcome', 'confirmed');
+      span.setAttribute('payment.transaction_id', payment.transaction_id);
+      res.locals.transaction_id = payment.transaction_id;
       res.status(201).json({
         order_id: orderId, status: 'CONFIRMED', total_cents: totalCents,
         reservation_id: reservationId, transaction_id: payment.transaction_id,
       });
-    } catch {
+    } catch (error) {
+      //potential trap: returning an HTTP error alone lost diagnostic details. we record the exception.
+      logEvent('error', 'checkout.exception', {
+        route: '/orders/checkout',
+        order_id: orderId,
+        reservation_id: reservationId,
+        error_type: error instanceof Error ? error.name : 'UnknownError',
+        error_message: error instanceof Error ? error.message : 'Unknown error',
+      });
+      span.recordException(error instanceof Error ? error : new Error(String(error)));
+      span.setStatus({ code: SpanStatusCode.ERROR });
+
       if (reservationId && !paymentStarted && !await releaseInventory()) {
-        fail(502, 'Checkout failed and inventory release failed'); return;
+        fail(502, 'Checkout failed and inventory release failed');
+        return;
       }
-      // A lost payment response does not prove the charge failed. Do not release stock blindly.
-      fail(503, paymentStarted ? `Payment outcome unknown; reservation ${reservationId} retained` : 'A checkout dependency is unavailable');
+
+      // A lost payment response does not prove the charge failed
+      fail(
+        503,
+        paymentStarted
+          ? `Payment outcome unknown; reservation ${reservationId} retained`
+          : 'A checkout dependency is unavailable',
+      );
     }
+      } finally {
+        // potential trap: success and early error returns must both finish the business span.
+        span.end();
+      }
+    });
   }
 );
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
-  console.log(`[${SERVICE_NAME}] Downstream targets: Auth=${AUTH_SERVICE_URL}, Catalog=${CATALOG_SERVICE_URL}, Payment=${PAYMENT_SERVICE_URL}`);
+  logEvent('info', 'service.started', {
+    port: PORT,
+    downstreams: {
+      auth: AUTH_SERVICE_URL,
+      catalog: CATALOG_SERVICE_URL,
+      payment: PAYMENT_SERVICE_URL,
+    },
+  });
 });

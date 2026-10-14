@@ -9,6 +9,7 @@ datasources:
     editable: false
 
   - name: Jaeger
+    uid: jaeger
     type: jaeger
     access: proxy
     url: http://jaeger:16686
@@ -19,3 +20,11 @@ datasources:
     access: proxy
     url: http://loki:3100
     editable: false
+    #trace_id in JSON alone does not create a clickable trace link. Following the course's correlation objective, we should configure a derived field pointing to the Jaeger datasource
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id"\s*:\s*"([0-9a-f]{32})"'
+          datasourceUid: jaeger
+          url: '$${__value.raw}'
+          urlDisplayLabel: 'View trace'

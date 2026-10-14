@@ -1,0 +1,50 @@
+//configuring a Loki datasource in Grafana could suggest logs were already collected, but logs need an ingestion path before Grafana can query them
+discovery.docker "cloudstore" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "cloudstore" {
+  targets = discovery.docker.cloudstore.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "service-(a|c)"
+    action        = "keep"
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "cloudstore"
+  }
+}
+
+loki.source.docker "cloudstore" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.cloudstore.output
+  forward_to = [loki.process.cloudstore.receiver]
+}
+
+loki.process "cloudstore" {
+  stage.json {
+    expressions = {
+      service = "service",
+      level   = "level",
+    }
+  }
+
+  // potential trap: correlation requires identifiers, but high-cardinality IDs stay in log fields, they must not become indexed Loki labels
+  stage.labels {
+    values = {
+      service = "",
+      level   = "",
+    }
+  }
+
+  forward_to = [loki.write.cloudstore.receiver]
+}
+
+loki.write "cloudstore" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
